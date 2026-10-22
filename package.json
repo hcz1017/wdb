@@ -1,0 +1,47 @@
+{
+  "name": "wdb",
+  "version": "0.1.0",
+  "description": "Source-level WebAssembly debugger for the browser — gdb's w-version. Instrument, pause, inspect, all inside a page.",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./instrument": "./src/instrument/wasm-bin.mjs",
+    "./runtime/mem-view": "./src/runtime/mem-view.mjs",
+    "./symbols": "./src/symbols/dwarf.js",
+    "./dap": "./src/adapters/dap/adapter.js",
+    "./stub": "./src/stub/wdb-stub.mjs"
+  },
+  "files": [
+    "src",
+    "assets",
+    "LICENSE",
+    "LICENSE.exception",
+    "NOTICE",
+    "README.md"
+  ],
+  "keywords": [
+    "webassembly",
+    "wasm",
+    "debugger",
+    "dwarf",
+    "dap",
+    "source-level-debugging",
+    "browser"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CHANGE-ME/wdb.git"
+  },
+  "dependencies": {
+    "@bjorn3/browser_wasi_shim": "^0.4.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs",
+    "build:dwarf": "node scripts/build-dwarf-worker.mjs"
+  }
+}

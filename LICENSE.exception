@@ -1,0 +1,14 @@
+wdb Stub Exception, version 1.0
+
+As a special exception, you may compile, link, and distribute a work that
+contains code from wdb-stub.c, wdb-stub.h, or wdb-stub.o (the "Stub"), or
+code instrumented by wdb (the "Instrumented Code"), without the terms of the
+GNU Affero General Public License version 3 applying to that work or to the
+parts of it that are not themselves part of wdb.
+
+This exception does not apply to the Stub itself, or to any modified version
+of it: if you modify the Stub, the exception does not extend to your modified
+version, and the AGPL-3.0-or-later applies to it as usual.
+
+Nothing in this exception limits any other rights or obligations you may have
+under the AGPL or under other licenses.
