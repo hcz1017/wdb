@@ -13,6 +13,26 @@
 import { instrumentWasm, firstInstrOffset, parseWasm } from "../../instrument/wasm-bin.mjs";
 import { SparseMem, EMPTY_MEM } from "../../runtime/mem-view.mjs";
 
+/**
+ * 把来源 URL/路径归一成可比较形式（解码 + 统一分隔符）。
+ * ⚠️ 纯 ASCII 文件名时 raw 与 percent-encoded 恰好相同，所以这个坑长期没暴露；
+ *    中文等非 ASCII 文件名下，DWARF 引擎返回的 sourceFileURL 与我们自己拼的
+ *    "file:///workspace/<名字>" 可能一个编码一个不编码 → 断点查表全部落空
+ *    （表现为断点灰色未验证、程序停不下来）。
+ */
+export function normalizeSourceUrl(u) {
+  let s = String(u || "");
+  // 只解码，不解成乱码：解码失败就保留原文
+  try { s = decodeURIComponent(s); } catch {}
+  return s.replace(/\\/g, "/");
+}
+/** 归一化后的文件名（比较不同来源 URL 时的唯一可靠依据） */
+export function sourceBaseName(u) {
+  const s = normalizeSourceUrl(u);
+  const i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
 /** 极小的 onDidX 事件源（替代 vscode.EventEmitter，保持宿主无关） */
 class Emitter {
   constructor() {
@@ -553,7 +573,8 @@ export class WasmDebugAdapter {
         if (i === 0 && site) { file = site.file; line = site.line; }
         // 只给"用户源文件"挂 source：sysroot 里的 crt1-command.c 之类是 wasisdk: 虚拟路径，
         // 挂上去会让 VS Code 尝试打开它并弹 "Unable to resolve resource wasisdk:..." 错误。
-        const isUserFile = !!file && file.endsWith("/" + this.target.fileName);
+        // ⚠️ 不能用 endsWith 比较原始串：中文文件名下引擎给的是编码形式
+        const isUserFile = !!file && sourceBaseName(file) === sourceBaseName(this.target.fileName);
         frames.push({
           id: i + 1, name,
           source: isUserFile
@@ -754,7 +775,7 @@ export class WasmDebugAdapter {
     this._assertAlive();
     this.log("③ 源文件 " + ((sources && sources.length) || 0) + " 个");
     this._term(`      \x1b[32m✓\x1b[0m 源文件 ${(sources || []).length} 个\r\n`);
-    const userFiles = (sources || []).filter((u) => /^file:\/\/\/workspace\//.test(u));
+    const userFiles = (sources || []).filter((u) => /^file:\/\/\/workspace\//.test(normalizeSourceUrl(u)));
     const sites = [];
     const siteByLine = new Map();   // `${file}:${line0}` -> [siteId]
     let nextId = 1;
@@ -783,7 +804,7 @@ export class WasmDebugAdapter {
           if (bodyIdx < 0) continue;
           const id = nextId++;
           sites.push({ id, line: line0 + 1, file, body: bodyIdx, origOffset });
-          const key = `${file}:${line0}`;
+          const key = `${normalizeSourceUrl(file)}:${line0}`;
           if (!siteByLine.has(key)) siteByLine.set(key, []);
           siteByLine.get(key).push(id);
         }
@@ -793,12 +814,21 @@ export class WasmDebugAdapter {
     if (!sites.length) throw new Error("没有生成任何语句站点（DWARF 行表为空？）");
     this._term(`      \x1b[32m✓\x1b[0m 可断点语句 ${sites.length} 个（用户文件 ${userFiles.length} 个）\r\n`);
 
+    // fileOfInterest：按"解码后的文件名"在引擎给的源文件里找，找不到就退化为唯一用户文件
+    const wantName = sourceBaseName(this.target.fileName);
+    const fileOfInterest = userFiles.find((u) => sourceBaseName(u) === wantName)
+      || (userFiles.length === 1 ? userFiles[0] : null)
+      || ("file:///workspace/" + this.target.fileName);
+    this.log(`④ 用户源文件 ${JSON.stringify(userFiles)} → 命中 ${fileOfInterest}`);
+
     const instr = instrumentWasm(orig, sites.map((s) => ({ id: s.id, offset: s.origOffset })));
     if (instr.dropped && instr.dropped.length) this.log(`插桩丢弃 ${instr.dropped.length} 个点`);
     this.session = {
       engine, orig, instr, sites, siteByLine, codeBase, importCount,
       bodies: info.code.bodies,
-      fileOfInterest: "file:///workspace/" + this.target.fileName,
+      // ⚠️ 必须用引擎返回的原始串（可能 percent-encoded），不能用我们自己拼的：
+      //    否则中文文件名下 siteByLine 查不到（断点全灰）
+      fileOfInterest: fileOfInterest,
       fileName: this.target.fileName,
       siteById: new Map(sites.map((s) => [s.id, s])),
       siteIdToBody: new Map(sites.map((s) => [s.id, s.body])),
@@ -818,7 +848,7 @@ export class WasmDebugAdapter {
     const line0 = line1 - 1;
     const tryLines = [line0, line0 + 1, line0 + 2, line0 + 3];
     for (const l of tryLines) {
-      const ids = s.siteByLine.get(`${s.fileOfInterest}:${l}`);
+      const ids = s.siteByLine.get(`${normalizeSourceUrl(s.fileOfInterest)}:${l}`);
       if (ids && ids.length) return ids;
     }
     return [];

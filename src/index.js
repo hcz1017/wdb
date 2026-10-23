@@ -25,4 +25,4 @@ export { WasmDebugAdapter } from "./adapters/dap/adapter.js";
 export { DBG_STUB_SOURCE, WDB_ABI_VERSION } from "./stub/wdb-stub.mjs";
 
 /** wdb 的语义版本；DAP 侧可用它做能力协商 */
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
