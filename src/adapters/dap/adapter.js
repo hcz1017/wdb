@@ -12,6 +12,7 @@
 //      compile:  ({source, fileName, flags, opt, debugInfo, debugStub}) => Promise<{wasm, log, exit}>
 import { instrumentWasm, firstInstrOffset, parseWasm } from "../../instrument/wasm-bin.mjs";
 import { SparseMem, EMPTY_MEM } from "../../runtime/mem-view.mjs";
+import { createWorker } from "../../runtime/create-worker.js";
 
 /**
  * 把来源 URL/路径归一成可比较形式（解码 + 统一分隔符）。
@@ -907,7 +908,8 @@ export class WasmDebugAdapter {
     this._term("程序即将运行。\r\n\x1b[90m· 输入直接在本终端键入（和平时运行一样）\r\n· 命中断点会在左侧停住，可看调用栈/单步\r\n· 停止会话请按调试工具条的 ⏹ 或 Ctrl+Shift+F5\x1b[0m\r\n\r\n");
     // 把焦点切到这个终端：否则用户会在"调试控制台"里输入（那里是 REPL，不喂 stdin）
     try { this.terminal?.show?.(); } catch {}
-    this.worker = new Worker(this.workerUrl);
+    // ⚠️ 用 createWorker：跨源 CDN / 桌面 VS Code 的 vscode-file:// 下 new Worker(url) 会被拦
+    this.worker = await createWorker(this.workerUrl, { log: (m) => this.log("[wdb] " + m) });
     this.worker.onmessage = (ev) => this._onWorkerMessage(ev.data);
     this.worker.onerror = (e) => { this._error2("debug worker 崩溃: " + ((e && e.message) || e)); };
     this.worker.postMessage({

@@ -1,6 +1,6 @@
 {
   "name": "wdb",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Source-level WebAssembly debugger for the browser — gdb's w-version. Instrument, pause, inspect, all inside a page.",
   "type": "module",
   "license": "AGPL-3.0-or-later",

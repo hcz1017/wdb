@@ -11,6 +11,8 @@
 //   getWasmLocal(local, stopId)                 -> {type:'i32'|'i64'|'f32'|'f64'|'v128', value}
 //   getWasmGlobal(global, stopId)               -> 同上
 //   getWasmOp(op, stopId)                       -> 同上
+import { createWorker } from "../runtime/create-worker.js";
+
 export class DwarfEngine {
   /**
    * @param {string} workerUrl  扩展里 dist/web/dwarfWorker.js 的 URL
@@ -18,7 +20,8 @@ export class DwarfEngine {
    * @param {object} host       4 个同步 getter 的实现
    */
   constructor(workerUrl, assetsBase, host) {
-    this.worker = new Worker(workerUrl);
+    this.workerUrl = workerUrl;
+    this.worker = null;              // 真正创建见 _ensureWorker()（可能要 fetch+blob）
     this.host = host || {};
     this.nextId = 0;
     this.requests = new Map();
@@ -28,16 +31,24 @@ export class DwarfEngine {
       this._resolveReady = resolve;
       this._rejectReady = reject;
     });
+    this.assetsBase = assetsBase;
+    // worker 的创建/事件绑定/__wdbConfig 发送都在 _ensureWorker()（见下）：
+    // 必须延迟且异步，因为跨源或 vscode-file: 时 new Worker(url) 会被拦，要先 fetch 成 blob。
+  }
+
+  /**
+   * 创建 worker（幂等）。跨源 / vscode-file: 等场景下 new Worker(url) 会被拦，
+   * createWorker 会 fetch 成 blob 再建。
+   */
+  async _ensureWorker() {
+    if (this.worker) return this.worker;
+    this.worker = await createWorker(this.workerUrl, { log: (m) => console.info("[wdb] " + m) });
     this.worker.addEventListener("message", (ev) => this._onMessage(ev.data));
     this.worker.addEventListener("error", (e) => {
       const raw = (e && (e.message || e.error)) || e;
       let msg = "dwarf worker error: " + raw;
-      // ⚠️ 经典 worker 的"脚本本身加载失败"在 Chrome 里也报成
-      //    "Failed to execute 'importScripts' … The script at '<url>' failed to load"，
-      //    最常见原因是【浏览器/边缘缓存了旧 extension bundle，去加载已不存在的旧 worker 文件名】。
-      //    打包脚本已改成真内容哈希避免再发生，这里给用户一句能自救的提示。
       if (/importScripts|failed to load|NetworkError/i.test(String(raw))) {
-        msg += `\n提示：worker 脚本 ${workerUrl} 加载失败 —— 通常是浏览器缓存了旧版本的扩展。` +
+        msg += `\n提示：worker 脚本 ${this.workerUrl} 加载失败 —— 通常是浏览器缓存了旧版本的扩展。` +
           "请按 Ctrl+Shift+R（Mac: Cmd+Shift+R）强制刷新页面后重试。";
       }
       const err = new Error(msg);
@@ -45,10 +56,12 @@ export class DwarfEngine {
       for (const { reject } of this.requests.values()) reject(err);
       this.requests.clear();
     });
-    this.worker.postMessage({ __wdbConfig: { base: String(assetsBase || "").replace(/\/+$/, "") } });
+    this.worker.postMessage({ __wdbConfig: { base: String(this.assetsBase || "").replace(/\/+$/, "") } });
+    return this.worker;
   }
 
   async start({ logPluginApiCalls = false } = {}) {
+    await this._ensureWorker();
     await this._ready;
     // hello 必须最先调用：把模块配置交给引擎
     await this.sendMessage("hello", [], !!logPluginApiCalls);

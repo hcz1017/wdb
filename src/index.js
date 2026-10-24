@@ -20,9 +20,10 @@
 
 export { instrumentWasm, parseWasm, firstInstrOffset } from "./instrument/wasm-bin.mjs";
 export { SparseMem, EMPTY_MEM } from "./runtime/mem-view.mjs";
+export { createWorker } from "./runtime/create-worker.js";
 export { DwarfEngine } from "./symbols/dwarf.js";
 export { WasmDebugAdapter } from "./adapters/dap/adapter.js";
 export { DBG_STUB_SOURCE, WDB_ABI_VERSION } from "./stub/wdb-stub.mjs";
 
 /** wdb 的语义版本；DAP 侧可用它做能力协商 */
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
