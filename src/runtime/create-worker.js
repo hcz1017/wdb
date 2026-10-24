@@ -42,7 +42,16 @@ export async function createWorker(url, opts = {}) {
     }
   }
 
-  const r = await fetch(abs);
+  // ⚠️ 加超时：某些宿主（例如桌面版的 Web 扩展宿主）对 vscode-file:// 的 fetch 不返回也不报错，
+  //    没有超时就会"卡着不动"，排查时极难定位。
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), opts.timeoutMs || 15000) : null;
+  let r;
+  try {
+    r = await fetch(abs, ctrl ? { signal: ctrl.signal } : undefined);
+  } catch (e) {
+    throw new Error(`worker 脚本获取失败（${(e && e.message) || e}）：${abs}`);
+  } finally { if (timer) clearTimeout(timer); }
   if (!r.ok) throw new Error(`worker 脚本获取失败（HTTP ${r.status}）：${abs}`);
   const code = await r.text();
   const blobUrl = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
