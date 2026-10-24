@@ -18,8 +18,11 @@ export class DwarfEngine {
    * @param {string} workerUrl  扩展里 dist/web/dwarfWorker.js 的 URL
    * @param {string} assetsBase 扩展 assets 目录的 URL（下面应有 dwarf/worker.js 与 dwarf/SymbolsBackend.wasm.gz）
    * @param {object} host       4 个同步 getter 的实现
+   * @param {object} [opts]
+   * @param {(url:string)=>Promise<Worker>} [opts.createWorker] 自定义 worker 工厂（Node 宿主用）
+   * @param {boolean} [opts.assumeReady] 引擎不握手 __wdbReady（Node 上游引擎）时直接视为就绪
    */
-  constructor(workerUrl, assetsBase, host) {
+  constructor(workerUrl, assetsBase, host, opts = {}) {
     this.workerUrl = workerUrl;
     this.worker = null;              // 真正创建见 _ensureWorker()（可能要 fetch+blob）
     this.host = host || {};
@@ -32,6 +35,8 @@ export class DwarfEngine {
       this._rejectReady = reject;
     });
     this.assetsBase = assetsBase;
+    this._createWorker = opts.createWorker || null;
+    this._assumeReady = !!opts.assumeReady;
     // worker 的创建/事件绑定/__wdbConfig 发送都在 _ensureWorker()（见下）：
     // 必须延迟且异步，因为跨源或 vscode-file: 时 new Worker(url) 会被拦，要先 fetch 成 blob。
   }
@@ -42,7 +47,9 @@ export class DwarfEngine {
    */
   async _ensureWorker() {
     if (this.worker) return this.worker;
-    this.worker = await createWorker(this.workerUrl, { log: (m) => console.info("[wdb] " + m) });
+    this.worker = this._createWorker
+      ? await this._createWorker(this.workerUrl)
+      : await createWorker(this.workerUrl, { log: (m) => console.info("[wdb] " + m) });
     this.worker.addEventListener("message", (ev) => this._onMessage(ev.data));
     this.worker.addEventListener("error", (e) => {
       const raw = (e && (e.message || e.error)) || e;
@@ -56,7 +63,12 @@ export class DwarfEngine {
       for (const { reject } of this.requests.values()) reject(err);
       this.requests.clear();
     });
-    this.worker.postMessage({ __wdbConfig: { base: String(this.assetsBase || "").replace(/\/+$/, "") } });
+    if (this._assumeReady) {
+      // Node 宿主里跑的是上游 node 版引擎：它自己用 fs 读 wasm，没有 __wdbConfig/__wdbReady 握手
+      this._resolveReady();
+    } else {
+      this.worker.postMessage({ __wdbConfig: { base: String(this.assetsBase || "").replace(/\/+$/, "") } });
+    }
     return this.worker;
   }
 

@@ -261,6 +261,10 @@ src = src.replace(
 
 writeFileSync(path.join(OUT, "worker.js"), src);
 
+// 同时保留一份**上游原件**（未注入浏览器 shim）：
+// 桌面版（Node 扩展宿主）要用它 —— emscripten 的 node 分支需要真正的 require/fs。
+writeFileSync(path.join(OUT, "worker.node.cjs"), readFileSync(workerPath));
+
 // ---- 资产：SymbolsBackend.wasm 压缩（56MB → 约十几 MB）----
 const wasm = readFileSync(wasmPath);
 const gz = gzipSync(wasm, { level: 9 });

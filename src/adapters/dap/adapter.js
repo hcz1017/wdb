@@ -63,15 +63,17 @@ export class WasmDebugAdapter {
    * @param {{source:string,fileName:string,flags:string}} o.target 要调试的源码
    * @param {() => Promise<any>} o.getEngine  返回 DWARF 引擎（已 start）
    * @param {(args:object)=>Promise<{wasm:Uint8Array,log:string,exit:number}>} o.compile 编译成调试产物
-   * @param {string} o.workerUrl   调试运行时 worker 的 URL（wdb 的 debug.worker 打包产物）
+   * @param {string} o.workerUrl   调试运行时 worker 的引用（web=URL，桌面=文件路径）
+   * @param {(url:string)=>Promise<Worker>} [o.createWorker] 自定义 worker 工厂（Node 宿主）
    * @param {(s:string)=>void} [o.log]
    * @param {(text:string)=>void} [o.onStatus]  状态提示（宿主自己决定画在哪）
    */
-  constructor({ target, getEngine, compile, workerUrl, log, onSnapshot, onFrame, terminal, onStatus }) {
+  constructor({ target, getEngine, compile, workerUrl, log, onSnapshot, onFrame, terminal, onStatus, createWorker: createWorkerFn }) {
     this.target = target;
     this.getEngine = getEngine;
     this.compile = compile;
     this.workerUrl = workerUrl;
+    this._createWorker = createWorkerFn || null;
     this.log = log || (() => {});
     this.onSnapshot = onSnapshot || (() => {});   // 把暂停时的内存快照交给符号引擎宿主
     this.onFrame = onFrame || (() => {});         // locals 快照位置 + 类型表（引擎读局部变量用）
@@ -909,7 +911,9 @@ export class WasmDebugAdapter {
     // 把焦点切到这个终端：否则用户会在"调试控制台"里输入（那里是 REPL，不喂 stdin）
     try { this.terminal?.show?.(); } catch {}
     // ⚠️ 用 createWorker：跨源 CDN / 桌面 VS Code 的 vscode-file:// 下 new Worker(url) 会被拦
-    this.worker = await createWorker(this.workerUrl, { log: (m) => this.log("[wdb] " + m) });
+    this.worker = this._createWorker
+      ? await this._createWorker(this.workerUrl)
+      : await createWorker(this.workerUrl, { log: (m) => this.log("[wdb] " + m) });
     this.worker.onmessage = (ev) => this._onWorkerMessage(ev.data);
     this.worker.onerror = (e) => { this._error2("debug worker 崩溃: " + ((e && e.message) || e)); };
     this.worker.postMessage({
