@@ -1076,6 +1076,15 @@ export class WasmDebugAdapter {
       const site = m.site;
       const where = site ? `${site.file.split("/").pop()}:${site.line}` : "?";
       const why = String(m.reason || "trap");
+      // ⚠️ 人类可读原因要在这里定义一次：on_exceptionInfo 与下面的 stopped 事件都用它。
+      //    （以前只在 on_exceptionInfo 里定义，stopped 事件引用了未定义的 short →
+      //     ReferenceError 把整个 _onWorkerMessage 打断，stopped 事件发不出去，
+      //     表现为"RE 后 UI 一直 running、无调用栈、变量面板空"。）
+      const short = /out of bounds/i.test(why) ? "数组越界（memory access out of bounds）"
+        : /divide by zero|remainder by zero/i.test(why) ? "整数除零"
+        : /call stack|stack overflow/i.test(why) ? "栈溢出（递归太深）"
+        : /unreachable/i.test(why) ? "执行到了 unreachable（未定义行为/编译器不可达路径）"
+        : why;
       this.log(`💥 崩溃（${why}）最后一句 ${where}，帧 ${trapFrames.length}` +
         (m.replayed ? "（影子重放：栈与变量可用）" : "（trap 后栈已展开，用最后一句合成）"));
       this._term(`\r\n\x1b[41;97m ⚠ 运行时错误 (RE) \x1b[0m ${why}\r\n` +
