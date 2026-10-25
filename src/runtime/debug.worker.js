@@ -12,6 +12,21 @@ const post = (m, transfer) => self.postMessage(m, transfer || []);
 // stdin 协议与 runWorker.js 完全一致：
 //   ctrl[0] state: 0=空闲(宿主可写) 1=有数据(worker 可取) 3=EOF；ctrl[1] len；data 从偏移 8 开始
 /** 终端 stdin：单槽握手 + _justServed（防止一次 fd_read 的第二个 iovec 假 EOF） */
+/** trap 重放用的"回放 stdin"：把录制下来的字节按顺序吐出（读空即 EOF 语义） */
+class ReplayStdin extends Fd {
+  constructor(bytes) { super(); this.bytes = bytes; this.pos = 0; }
+  fd_fdstat_get() {
+    return { ret: 0, fdstat: { fs_filetype: 2, fs_flags: 0, fs_rights_base: 0xffffffffn, fs_rights_inheriting: 0xffffffffn } };
+  }
+  fd_read(size) {
+    const n = Math.min(size, this.bytes.length - this.pos);
+    if (n <= 0) return { ret: 0, data: new Uint8Array(0) };
+    const data = this.bytes.slice(this.pos, this.pos + n);
+    this.pos += n;
+    return { ret: 0, data };
+  }
+}
+
 class TermStdin extends Fd {
   constructor(sab) {
     super();
@@ -38,6 +53,7 @@ class TermStdin extends Fd {
         Atomics.notify(this.ctrl, 0);
         post({ type: "consumed" });          // 让宿主继续冲刷输入队列
         this._justServed = true;
+        if (stdinRecordLen < STDIN_RECORD_CAP) { stdinRecord.push(data.slice(0)); stdinRecordLen += data.length; }
         return { ret: 0, data };
       }
       // 同一次 syscall 的第二个 iovec：已交付过就不能再阻塞等新输入
@@ -59,6 +75,13 @@ let stopBody = -1;             // 最近一次暂停所在的函数体（stepOve
 let stopLine = -1;             // 最近一次暂停的行号（单步按行前进，避免同一条语句反复停）
 let running = false;
 let pending = null;            // probe 判定要暂停后暂存的站点（等 pause() 真正停）
+let lastSite = null;           // 最后经过的语句站点（trap 时用它近似定位崩溃行）
+let trapped = null;            // 已因 trap 暂停（之后不再继续执行）
+// ---- trap 影子重放（拿到完整调用栈 + 崩溃瞬间的变量）----
+const stdinRecord = [];        // 录下的 stdin 字节块（交互输入也能重放）
+let stdinRecordLen = 0;
+const STDIN_RECORD_CAP = 16 * 1024 * 1024;
+const replay = { active: false, target: 0, budget: 0, hit: false };
 let scratchBase = 0;           // locals 快照区（memory.grow 出来的那一页）
 let bodyLocals = [];           // 每个函数体的 local 类型表（来自插桩）
 let globalTypes = [];          // 全局变量类型表（插桩时按 wasm global 索引顺序）
@@ -93,6 +116,19 @@ function stackDepth() { try { return captureStack().length; } catch { return sto
 function probe(siteId) {
   const site = siteById.get(siteId);
   if (!site) return 0;
+  lastSite = site;                 // 廉价：trap 时用它说明"崩溃前最后一句在哪"
+  // ---- 重放模式：只关心"是否到达目标站点"，不看断点/单步 ----
+  if (replay.active) {
+    if (replay.budget-- <= 0) throw new Error("__oi_replay_abort");
+    if (siteId !== replay.target) return 0;
+    // 到达目标：照常准备 locals 快照区，交给 pause() 上报
+    if (!scratchBase) {
+      try { const old = inst.exports.memory.buffer.byteLength; inst.exports.memory.grow(1); scratchBase = old; } catch { scratchBase = 0; }
+    }
+    pending = site;
+    replay.hit = true;
+    return scratchBase;
+  }
   // 别名组：多个源码语句的栈空回退点可能撞到同一插桩位置，
   // 任意一个别名 id 命中断点都算命中
   const ids = [siteId, ...(site.aliases || [])];
@@ -144,6 +180,41 @@ function pause() {
   if (!site) return;
 
   const frames = captureStack();
+  const snap = snapshotMemory(site);
+  if (replay.active) {
+    post({
+      type: "trap", replayed: true, reason: trapped && trapped.reason, message: trapped && trapped.message,
+      site, siteId: site.id, frames,
+      memorySegments: snap.memorySegments, memorySize: snap.memorySize,
+      localsBase: scratchBase, body: site.body,
+      bodyLocals: bodyLocals[site.body] || [],
+      globalsBase: scratchBase + (bodyLocals[site.body] || []).length * 8,
+      globalTypes,
+    });
+    Atomics.wait(ctrl, 0, 0);
+    try { Atomics.store(ctrl, 0, 0); } catch {}
+    return;
+  }
+  post({
+    type: "paused", siteId: site.id, site, frames,
+    memorySegments: snap.memorySegments, memorySize: snap.memorySize,
+    localsBase: scratchBase, body: site.body,
+    bodyLocals: bodyLocals[site.body] || [],
+    globalsBase: scratchBase + (bodyLocals[site.body] || []).length * 8,
+    globalTypes,
+  });
+
+  Atomics.wait(ctrl, 0, 0);
+  const mode = Atomics.load(ctrl, 1) || 1;
+  resumeMode = mode;
+  stopBody = site.body;
+  stopLine = site.line;
+  stopDepth = frames.length;      // stepOut 用它判断"是否已返回到调用者"
+  Atomics.store(ctrl, 0, 0);
+}
+
+/** 分段内存快照（低区 + 实际用到的栈；512MB 栈不能整块拷） */
+function snapshotMemory(site) {
   // ---- 分段内存快照 ----
   // ⚠️ 必须分段：调试栈 512MB，整块拷贝会让每次暂停卡死（详见 mem-view.mjs 注释）。
   //    栈区起点用 __stack_pointer（wasi-sdk 输出里是全局 0）反推，
@@ -177,24 +248,7 @@ function pause() {
       memorySegments = segs;
     }
   } catch { memorySegments = null; }
-
-  const locals = bodyLocals[site.body] || [];
-  post({
-    type: "paused", siteId: site.id, site, frames, memorySegments, memorySize,
-    localsBase: scratchBase, body: site.body,
-    bodyLocals: locals,
-    // globals 紧跟在 locals 之后；宿主按 globalTypes 解释
-    globalsBase: scratchBase + locals.length * 8,
-    globalTypes,
-  });
-
-  Atomics.wait(ctrl, 0, 0);
-  const mode = Atomics.load(ctrl, 1) || 1;
-  resumeMode = mode;
-  stopBody = site.body;
-  stopLine = site.line;
-  stopDepth = frames.length;      // stepOut 用它判断"是否已返回到调用者"
-  Atomics.store(ctrl, 0, 0);
+  return { memorySegments, memorySize };
 }
 
 async function run() {
@@ -238,10 +292,84 @@ async function run() {
   } catch (e) {
     if (e && typeof e.code === "number") code = e.code;
     else if (e && e.name === "WASIProcExit") code = e.code ?? 0;
+    else if (isTrap(e)) {
+      const msg = String((e && (e.message || e)) || e);
+      trapped = { reason: msg, message: msg, site: lastSite };
+      // 先在"影子实例"里重放到崩溃前那一句 → 拿到完整调用栈 + 当时的变量
+      const ok = await replayToTrap(mod);
+      if (!ok) {
+        reportTrap(e);
+        // 崩溃后不要立刻 exit：像普通暂停一样阻塞，等宿主"停止会话"再结束，
+        // 否则 UI 上会一闪而过（stopped → terminated）。
+        try { Atomics.wait(ctrl, 0, 0); } catch {}
+      }
+      code = -1;
+    }
     else post({ type: "error", message: "运行异常: " + ((e && (e.stack || e.message)) || e) });
   }
   running = false;
   post({ type: "exit", code });
+}
+
+// ---------------- trap（wasm 崩溃）----------------
+// 越界 / unreachable / 除零 / 栈溢出 等会直接抛 WebAssembly.RuntimeError，
+// 以前只回一个 "exit code"，用户看不到在哪炸的。这里抓下来当"异常暂停"上报。
+const TRAP_RE = /unreachable|out of bounds|divide by zero|remainder by zero|call stack|stack overflow|invalid conversion|invalid value|signature mismatch|table index|indirect call|null function|integer overflow|undefined element/i;
+function isTrap(e) {
+  if (!e) return false;
+  if (typeof WebAssembly !== "undefined" && e instanceof WebAssembly.RuntimeError) return true;
+  return TRAP_RE.test(String((e && e.message) || e));
+}
+/**
+ * 影子实例重放：用同一份 wasm + 录制的 stdin 重跑，停在"崩溃前最后那一句"。
+ * 成功时 pause() 会直接上报 {type:"trap", replayed:true, frames, locals…} 并阻塞等宿主。
+ * 失败（没有站点 / 到不了目标 / 预算超限 / 需要更多输入）返回 false，调用方退回简版上报。
+ */
+async function replayToTrap(mod) {
+  const site = lastSite;
+  if (!site) return false;
+  replay.active = true; replay.target = site.id; replay.budget = 2_000_000; replay.hit = false;
+  const prevInst = inst, prevPending = pending, prevScratch = scratchBase;
+  scratchBase = 0; pending = null;
+  try {
+    const all = new Uint8Array(stdinRecordLen);
+    let off = 0;
+    for (const c of stdinRecord) { all.set(c, off); off += c.length; }
+    const fds = [
+      new ReplayStdin(all),
+      new ConsoleStdout(() => {}),   // 重放不重复打印用户输出
+      new ConsoleStdout(() => {}),
+    ];
+    const wasi2 = new WASI([cfg.fileName || "program"], [], fds);
+    inst = await WebAssembly.instantiate(mod, {
+      wasi_snapshot_preview1: wasi2.wasiImport,
+      wdb: { probe, pause },
+    });
+    try { wasi2.start(inst); } catch { /* 到达目标前又 trap / 预算中止：都算未命中 */ }
+  } catch { /* 忽略：走简版上报 */ }
+  finally {
+    replay.active = false;
+    inst = prevInst;
+    scratchBase = prevScratch;
+    pending = prevPending;
+  }
+  return replay.hit;
+}
+
+function reportTrap(e) {
+  const msg = String((e && (e.message || e)) || e);
+  const frames = captureStack();
+  const site = lastSite || null;
+  let snap = { memorySegments: null, memorySize: 0 };
+  try { snap = snapshotMemory(site || { body: -1 }); } catch {}
+  trapped = { reason: msg, site };
+  post({
+    type: "trap", reason: msg, message: msg, frames,
+    site, siteId: site ? site.id : 0,
+    memorySegments: snap.memorySegments, memorySize: snap.memorySize,
+    // trap 之后栈已展开，locals 不可靠 → 明确给空表，让变量面板显示不可用而不是乱值
+    body: site ? site.body : -1, bodyLocals: [], localsBase: 0, globalTypes,
+  });
 }
 
 const dec = new TextDecoder();

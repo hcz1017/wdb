@@ -91,8 +91,14 @@ export class WasmDebugAdapter {
     this.stdinCtrl = null;
     this.stdinBuf = null;
     this._inputQueue = [];      // 终端输入缓冲（宿主只能在工作线程空闲时写单槽）
-    this.paused = null;         // { siteId, frames, memory, site }
+    this.paused = null;
+    this.trapped = null;      // { reason, site } —— 程序已崩溃，只能看不能继续         // { siteId, frames, memory, site }
     this.enabledSites = new Set();
+    // ⚠️ VS Code 会为**每个有断点的文件**各发一次 setBreakpoints。
+    //    以前每次都用本次结果覆盖 enabledSites → 最后一个文件（往往是别的 .cpp，
+    //    在当前调试目标里查不到站点）把集合清空 → "断点已验证但程序不停"。
+    //    正确做法：按来源文件分别保存，取并集。
+    this._bpsByFile = new Map();
     this.terminated = false;
     this.memory = null;         // 暂停时的内存快照
     this._configured = false;
@@ -480,6 +486,9 @@ export class WasmDebugAdapter {
     this._respond(req, {
       supportsConfigurationDoneRequest: true,
       supportsEvaluateForHovers: true,
+      supportsExceptionInfoRequest: true,
+      supportsExceptionFilterOptions: false,
+      exceptionBreakpointFilters: [],
       supportsTerminateRequest: true,
       supportsRestartRequest: false,
       supportsSetVariable: false,
@@ -522,6 +531,26 @@ export class WasmDebugAdapter {
     const bps = [];
     const s = this.session;
     const enabled = new Set();
+    // ⚠️ 只认「当前调试目标文件」的断点。
+    //    VS Code 会为工作区里**每个**有断点的文件各发一次 setBreakpoints，而 _resolveLine
+    //    是按行号在当前目标的站点表里查——不校验来源文件的话，别的 .cpp 的第 15 行会命中
+    //    当前文件第 15 行的站点，于是"别的文件的断点被验证通过"，程序在莫名其妙的地方停下。
+    const srcName = sourceBaseName((args.source && (args.source.path || args.source.name)) || "");
+    const tgtName = sourceBaseName(this.target.fileName);
+    if (!srcName || srcName !== tgtName) {
+      for (const b of args.breakpoints || []) {
+        bps.push({ verified: false, line: b.line | 0, message: "不属于当前调试目标（只调试打开的那个文件）" });
+      }
+      const fileKey0 = String((args.source && (args.source.path || args.source.name)) || "?");
+      this._bpsByFile.set(fileKey0, new Set());
+      const u0 = new Set();
+      for (const set of this._bpsByFile.values()) for (const id of set) u0.add(id);
+      this.enabledSites = u0;
+      this._syncBreakpointsToWorker();
+      this.log(`断点 ${fileKey0}: 忽略（不是当前调试目标 ${this.target.fileName}）`);
+      this._respond(req, { breakpoints: bps });
+      return;
+    }
     for (const b of args.breakpoints || []) {
       const line = b.line | 0;                       // DAP 1-based
       const siteIds = s ? this._resolveLine(line) : [];
@@ -532,7 +561,11 @@ export class WasmDebugAdapter {
       for (const id of siteIds) enabled.add(id);
       bps.push({ verified: true, line });
     }
-    this.enabledSites = enabled;
+    const fileKey = String((args.source && (args.source.path || args.source.name)) || "?");
+    this._bpsByFile.set(fileKey, enabled);
+    const union = new Set();
+    for (const set of this._bpsByFile.values()) for (const id of set) union.add(id);
+    this.enabledSites = union;
     this._syncBreakpointsToWorker();
     this.log(`断点 ${(args.source && args.source.path) || "?"}: ${bps.filter((x) => x.verified).length}/${bps.length} 已验证`);
     this._respond(req, { breakpoints: bps });
@@ -542,6 +575,27 @@ export class WasmDebugAdapter {
     this._configured = true;
     this._respond(req, {});
     await this._startProgram();
+  }
+
+  async on_exceptionInfo(req) {
+    if (!this.trapped) { this._respond(req, { exceptionId: "-", exceptionDescription: "没有异常" }); return; }
+    const why = String(this.trapped.reason || "trap");
+    const site = this.trapped.site;
+    const where = site ? `${site.file.split("/").pop()}:${site.line}` : "未知位置";
+    const short = /out of bounds/i.test(why) ? "数组越界（memory access out of bounds）"
+      : /divide by zero|remainder/i.test(why) ? "整数除零/取模 0（divide by zero）"
+      : /call stack|stack overflow/i.test(why) ? "栈溢出（递归太深 / 局部变量过大）"
+      : /unreachable/i.test(why) ? "unreachable（编译器认为不可达的路径被执行了，常见于 UB 之后的错误分支）"
+      : why;
+    this._respond(req, {
+      exceptionId: short,
+      exceptionDescription:
+        `程序在 WebAssembly 层崩溃：${why}\n` +
+        `崩溃前最后执行的一句：${where}` +
+        (this.trapped.replayed ? "\n（已用影子重放停在崩溃前，locals 为崩溃瞬间的值）" : "\n（栈已展开，locals 不可读）"),
+      breakMode: "unhandled",
+      details: { typeName: "wasm trap", message: why, stack: undefined },
+    });
   }
 
   async on_threads(req) { this._respond(req, { threads: [{ id: 1, name: "main (wasm)" }] }); }
@@ -554,7 +608,8 @@ export class WasmDebugAdapter {
       const engine = s.engine;
       for (let i = 0; i < p.frames.length; i++) {
         const f = p.frames[i];
-        const bodyIdx = f.funcIndex - s.importCount;
+        // 合成帧（trap）只带 body；真实帧用 funcIndex - importCount
+        const bodyIdx = (f.body != null && f.funcIndex == null) ? f.body : (f.funcIndex - s.importCount);
         const body = s.bodies[bodyIdx];
         let file = "", line = 0, name = f.name || ("wasm-function[" + f.funcIndex + "]");
         if (body) {
@@ -720,8 +775,11 @@ export class WasmDebugAdapter {
   // ---------------------------------------------------------------- 内部
   _resume(req, mode) {
     if (!this.worker || !this.ctrl) { this._respond(req, {}); return; }
+    // 崩溃之后只能"结束会话"：单步没有意义，统一按 continue 处理（随后会收到 exit）
+    if (this.trapped) mode = 1;
     this._lastMode = mode;
     this.paused = null;
+    this.trapped = null;      // { reason, site } —— 程序已崩溃，只能看不能继续
     this._event("continued", { threadId: 1, allThreadsContinued: true });
     this._statusMsg("$(debug-alt) OI C++ 调试：运行中");
     // ⚠️ 必须由宿主直接写 SAB：worker 正在 Atomics.wait，收不到 postMessage
@@ -980,6 +1038,51 @@ export class WasmDebugAdapter {
       this._kill();
       return;
     }
+    if (m.type === "trap") {
+      // 程序在 wasm 层崩了（越界/unreachable/除零/栈溢出）：栈已展开，无法继续执行，
+      // 但仍把"崩溃前最后一句 C++ 在哪"和调用栈给用户，比一句 exit code 有用得多。
+      this.trapped = { reason: m.reason || m.message || "trap", site: m.site || null, replayed: !!m.replayed };
+      // ⚠️ trap 已经把 wasm 栈展开，worker 里 captureStack() 抓不到任何帧。
+      //    用"崩溃前最后一句"的站点合成一帧，至少能定位到函数与行；
+      //    真正完整的调用链需要"影子实例重放"（见 CHANGELOG 后续计划）。
+      const trapFrames = (m.frames && m.frames.length)
+        ? m.frames
+        : (m.site ? [{ body: m.site.body, offset: 0, name: "", synthetic: true }] : []);
+      this.paused = {
+        siteId: m.siteId || 0, site: m.site || null, frames: trapFrames,
+        memory: null, stopId: { siteId: m.siteId || 0 },
+        localsBase: m.localsBase || 0, bodyLocals: m.bodyLocals || [],
+      };
+      this.memory = m.memorySegments
+        ? new SparseMem(m.memorySize || 0, m.memorySegments)
+        : EMPTY_MEM;
+      this.onSnapshot(this.memory);
+      // 重放成功时 locals 是真实可读的（栈还活着）；否则给空表，引擎会显示不可用
+      this.onFrame?.({
+        base: m.localsBase || 0, types: m.localsBase ? (m.bodyLocals || []) : [],
+        globalsBase: m.globalsBase || 0, globalTypes: m.globalTypes || [],
+      });
+      const site = m.site;
+      const where = site ? `${site.file.split("/").pop()}:${site.line}` : "?";
+      const why = String(m.reason || "trap");
+      this.log(`💥 崩溃（${why}）最后一句 ${where}，帧 ${trapFrames.length}` +
+        (m.replayed ? "（影子重放：栈与变量可用）" : "（trap 后栈已展开，用最后一句合成）"));
+      this._term(`\r\n\x1b[41;97m ⚠ 运行时错误 (RE) \x1b[0m ${why}\r\n` +
+        `\x1b[90m崩溃前最后执行的一句：${where}` +
+        (m.replayed ? "（已重放到该语句，变量面板可看当时的 locals）" : "（栈已展开，locals 不可读；变量面板仍可看全局/堆）") +
+        `\x1b[0m\r\n`);
+      this._statusMsg(`$(error) 程序崩溃：${why}`);
+      this._event("output", { category: "stderr", output: `程序崩溃：${why}\n崩溃前最后一句：${where}\n` });
+      this._event("stopped", {
+        reason: "exception",
+        threadId: 1,
+        allThreadsStopped: true,
+        text: why,
+        description: `${short || why}（最后执行 ${where}）`,
+      });
+      this.log(`⏸ 因异常暂停（RE）：${short || why} @ ${where} —— VS Code 调试工具条会显示异常信息`);
+      return;
+    }
     if (m.type === "paused") {
       this.paused = {
         siteId: m.siteId, site: m.site, frames: m.frames || [], memory: m.memory, stopId: { siteId: m.siteId },
@@ -1032,6 +1135,7 @@ export class WasmDebugAdapter {
     this._objRefs.clear();
     if (this.worker) { try { this.worker.postMessage({ type: "shutdown" }); } catch {} try { this.worker.terminate(); } catch {} this.worker = null; }
     this.paused = null;
+    this.trapped = null;      // { reason, site } —— 程序已崩溃，只能看不能继续
     this.memory = null;
     try { this._status?.dispose(); } catch {}
     this._status = null;
