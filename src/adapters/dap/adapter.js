@@ -535,9 +535,14 @@ export class WasmDebugAdapter {
     //    VS Code 会为工作区里**每个**有断点的文件各发一次 setBreakpoints，而 _resolveLine
     //    是按行号在当前目标的站点表里查——不校验来源文件的话，别的 .cpp 的第 15 行会命中
     //    当前文件第 15 行的站点，于是"别的文件的断点被验证通过"，程序在莫名其妙的地方停下。
-    const srcName = sourceBaseName((args.source && (args.source.path || args.source.name)) || "");
-    const tgtName = sourceBaseName(this.target.fileName);
-    if (!srcName || srcName !== tgtName) {
+    //    比较用完整路径（percent 解码归一化），不能用文件名：不同目录下的同名文件
+    //    （a/main.cpp 与 b/main.cpp）会被误判成同一个 → 断点串到别的文件上。
+    const srcKey = normalizeSourceUrl((args.source && (args.source.path || args.source.name)) || "");
+    const tgtKey = normalizeSourceUrl(this.target.sourceUri || this.target.fileName);
+    const sameFile = (!!srcKey && srcKey === tgtKey) ||
+      // 兜底：宿主可能只给裸文件名（没有目录信息），此时才允许按文件名比较
+      (!!srcKey && !srcKey.includes("/") && sourceBaseName(srcKey) === sourceBaseName(tgtKey));
+    if (!srcKey || !sameFile) {
       for (const b of args.breakpoints || []) {
         bps.push({ verified: false, line: b.line | 0, message: "不属于当前调试目标（只调试打开的那个文件）" });
       }
@@ -632,6 +637,10 @@ export class WasmDebugAdapter {
         // 只给"用户源文件"挂 source：sysroot 里的 crt1-command.c 之类是 wasisdk: 虚拟路径，
         // 挂上去会让 VS Code 尝试打开它并弹 "Unable to resolve resource wasisdk:..." 错误。
         // ⚠️ 不能用 endsWith 比较原始串：中文文件名下引擎给的是编码形式
+        // ⚠️ file 是编译产物 DWARF 里的路径（确定是 file:///workspace/<fileName> 形态），
+        //    target.sourceUri 是 VS Code 文档 URI（vscode-test-web://…/中文.cpp 等），两者必然不同。
+        //    这里比较 basename 即可：DWARF 只可能来自我们编译的这一个文件，不存在"别的目录
+        //    的同名文件混进来"的问题（那是 setBreakpoints 侧的事，已在上面按完整路径拦掉）。
         const isUserFile = !!file && sourceBaseName(file) === sourceBaseName(this.target.fileName);
         frames.push({
           id: i + 1, name,
@@ -875,9 +884,11 @@ export class WasmDebugAdapter {
     if (!sites.length) throw new Error("没有生成任何语句站点（DWARF 行表为空？）");
     this._term(`      \x1b[32m✓\x1b[0m 可断点语句 ${sites.length} 个（用户文件 ${userFiles.length} 个）\r\n`);
 
-    // fileOfInterest：按"解码后的文件名"在引擎给的源文件里找，找不到就退化为唯一用户文件
+    // fileOfInterest：优先按完整路径匹配；找不到再按"解码后的文件名"（兜底：引擎可能只给文件名）
+    const wantKey = normalizeSourceUrl(this.target.sourceUri || this.target.fileName);
     const wantName = sourceBaseName(this.target.fileName);
-    const fileOfInterest = userFiles.find((u) => sourceBaseName(u) === wantName)
+    const fileOfInterest = userFiles.find((u) => normalizeSourceUrl(u) === wantKey)
+      || userFiles.find((u) => sourceBaseName(u) === wantName)
       || (userFiles.length === 1 ? userFiles[0] : null)
       || ("file:///workspace/" + this.target.fileName);
     this.log(`④ 用户源文件 ${JSON.stringify(userFiles)} → 命中 ${fileOfInterest}`);
