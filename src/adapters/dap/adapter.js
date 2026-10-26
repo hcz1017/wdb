@@ -11,6 +11,7 @@
 //      onStatus: (text) => void    状态栏提示（可省略）
 //      compile:  ({source, fileName, flags, opt, debugInfo, debugStub}) => Promise<{wasm, log, exit}>
 import { instrumentWasm, firstInstrOffset, parseWasm } from "../../instrument/wasm-bin.mjs";
+import { WDB_VERSION, WDB_REPO, APP_REPO, WDB_LICENSE } from "../../version.js";
 import { SparseMem, EMPTY_MEM } from "../../runtime/mem-view.mjs";
 import { createWorker } from "../../runtime/create-worker.js";
 
@@ -68,12 +69,13 @@ export class WasmDebugAdapter {
    * @param {(s:string)=>void} [o.log]
    * @param {(text:string)=>void} [o.onStatus]  状态提示（宿主自己决定画在哪）
    */
-  constructor({ target, getEngine, compile, workerUrl, log, onSnapshot, onFrame, terminal, onStatus, createWorker: createWorkerFn }) {
+  constructor({ target, getEngine, compile, workerUrl, log, onSnapshot, onFrame, terminal, onStatus, version, createWorker: createWorkerFn }) {
     this.target = target;
     this.getEngine = getEngine;
     this.compile = compile;
     this.workerUrl = workerUrl;
     this._createWorker = createWorkerFn || null;
+    this.hostVersion = version || "";           // 宿主扩展版本（WebC++ 0.2.x），横幅里带上
     this.log = log || (() => {});
     this.onSnapshot = onSnapshot || (() => {});   // 把暂停时的内存快照交给符号引擎宿主
     this.onFrame = onFrame || (() => {});         // locals 快照位置 + 类型表（引擎读局部变量用）
@@ -446,6 +448,22 @@ export class WasmDebugAdapter {
     return sz == null ? 4 : Math.min(sz, 8);
   }
 
+  /**
+   * 启动横幅：仿 gdb 起手那几行（版本 / 版权 / 许可证 / 免责 / 出处）。
+   * 调试器是自己写的（wdb），第一次见的人该知道它是什么、什么许可证、去哪看源码。
+   */
+  _banner() {
+    const host = this.hostVersion ? `｜WebC++ ${this.hostVersion}` : "";
+    this._term(
+      `\x1b[1mwdb ${WDB_VERSION}\x1b[0m —— WebAssembly 源码级调试器（gdb 的 w 版）${host}\r\n` +
+      `\x1b[90mCopyright (C) 2026 hcz1017 及贡献者\r\n` +
+      `License ${WDB_LICENSE}：GNU Affero 通用公共许可证第 3 版或更新 <https://www.gnu.org/licenses/agpl-3.0.html>\r\n` +
+      `桩文件（wdb-stub.c / LICENSE.exception）另有链接例外，随作品分发不受 AGPL 传染。\r\n` +
+      `这是自由软件：你可以自由修改与再分发；不提供任何担保。\r\n` +
+      `源码与反馈：${WDB_REPO}　｜　WebC++ 扩展：${APP_REPO}\x1b[0m\r\n\r\n`);
+    this.log(`wdb ${WDB_VERSION}${host}（${WDB_LICENSE}）${WDB_REPO}`);
+  }
+
   _term(text) {
     if (!this.terminal) return;
     const s = String(text).replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
@@ -515,6 +533,7 @@ export class WasmDebugAdapter {
 
   async _launch(req) {
     this._statusMsg("$(sync~spin) OI C++ 调试：准备中…");
+    this._banner();
     this._term("\x1b[36m== OI C++ 调试（WASM）==\x1b[0m\r\n");
     this._term(`源文件: ${this.target.fileName}\r\n`);
     this._event("output", { category: "console", output: "正在构建调试版本（-O0 -g，带插桩桩）…\n" });
@@ -586,7 +605,7 @@ export class WasmDebugAdapter {
     if (!this.trapped) { this._respond(req, { exceptionId: "-", exceptionDescription: "没有异常" }); return; }
     const why = String(this.trapped.reason || "trap");
     const site = this.trapped.site;
-    const where = site ? `${site.file.split("/").pop()}:${site.line}` : "未知位置";
+    const where = site ? `${sourceBaseName(site.file)}:${site.line}` : "未知位置";
     const short = /out of bounds/i.test(why) ? "数组越界（memory access out of bounds）"
       : /divide by zero|remainder/i.test(why) ? "整数除零/取模 0（divide by zero）"
       : /call stack|stack overflow/i.test(why) ? "栈溢出（递归太深 / 局部变量过大）"
@@ -645,7 +664,7 @@ export class WasmDebugAdapter {
         frames.push({
           id: i + 1, name,
           source: isUserFile
-            ? { name: file.split("/").pop(), path: this.target.sourceUri || file }
+            ? { name: sourceBaseName(file), path: this.target.sourceUri || file }
             : undefined,
           line: isUserFile ? line : 0,
           column: 1,
@@ -1074,7 +1093,7 @@ export class WasmDebugAdapter {
         globalsBase: m.globalsBase || 0, globalTypes: m.globalTypes || [],
       });
       const site = m.site;
-      const where = site ? `${site.file.split("/").pop()}:${site.line}` : "?";
+      const where = site ? `${sourceBaseName(site.file)}:${site.line}` : "?";
       const why = String(m.reason || "trap");
       // ⚠️ 人类可读原因要在这里定义一次：on_exceptionInfo 与下面的 stopped 事件都用它。
       //    （以前只在 on_exceptionInfo 里定义，stopped 事件引用了未定义的 short →
@@ -1118,7 +1137,7 @@ export class WasmDebugAdapter {
       });
       this.stats.pauses++;
       const site = m.site;
-      const where = site ? `${site.file.split("/").pop()}:${site.line}` : "?";
+      const where = site ? `${sourceBaseName(site.file)}:${site.line}` : "?";
       this.log(`⏸ 暂停 site=${m.siteId} ${where}（栈 ${this.paused.frames.length} 帧，内存 ${(this.memory.byteLength / 1048576).toFixed(1)}MB，快照拷贝 ${(this.memory.bytesCopied / 1048576).toFixed(1)}MB）`);
       this._term(`\r\n\x1b[33m[暂停] ${where}（第 ${this.stats.pauses} 次）\x1b[0m\r\n`);
       this._statusMsg(`$(debug-pause) OI C++ 调试：已暂停 ${where}`);
