@@ -35,6 +35,47 @@ export function sourceBaseName(u) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
+/** 去掉 scheme://authority，只留路径部分（"file:///a/b.cpp" → "/a/b.cpp"） */
+export function sourcePathKey(u) {
+  const s = normalizeSourceUrl(u);
+  const m = /^[a-z][a-z0-9+.-]*:\/\/[^/]*(\/.*)?$/i.exec(s);
+  return m ? (m[1] || "/") : s;
+}
+
+/**
+ * 判断「VS Code 发来的断点来源」和「当前调试目标」是不是同一个文件。
+ *
+ * ⚠️ 这里踩过两次坑，两个方向都不能走极端：
+ *   · 只比文件名（`sourceBaseName`）→ 别的目录下的同名文件会把断点串过来，程序乱停；
+ *   · 只比完整字符串 → 同一文件的不同写法永远对不上，断点全部"未验证"、程序不停。
+ *     真实例子（vscode.dev + 本地文件夹工作区）：
+ *        VS Code 发来的 path = "\\ws\\sub\\a.cpp"（工作区根名 + 反斜杠、没有 scheme）
+ *        我们的 target.sourceUri = "file:///ws/sub/a.cpp"
+ *     两者指同一个文件，直接字符串比较必然失败。
+ *
+ * 所以分层判断，任一层成立即可：
+ *   1. 归一化后完全相等；
+ *   2. 路径部分相等（去掉 scheme://authority 之后）；
+ *   3. 按路径分量**从尾部逐级**比较（以较短者为准）—— 兼容"工作区相对路径 / 只有文件名"。
+ * 同时：只要文件名不同就一定不是同一文件（这一条挡住"别的文件的断点命中同号行"）。
+ */
+export function sameSourceFile(a, b) {
+  const na = normalizeSourceUrl(a), nb = normalizeSourceUrl(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const pa = sourcePathKey(na), pb = sourcePathKey(nb);
+  if (pa === pb) return true;
+  const ca = pa.split("/").filter(Boolean);
+  const cb = pb.split("/").filter(Boolean);
+  if (!ca.length || !cb.length) return false;
+  if (ca[ca.length - 1] !== cb[cb.length - 1]) return false;   // 文件名不同 → 不是同一文件
+  const n = Math.min(ca.length, cb.length);
+  for (let i = 1; i <= n; i++) {
+    if (ca[ca.length - i] !== cb[cb.length - i]) return false; // 尾部逐级比对
+  }
+  return true;
+}
+
 /** 极小的 onDidX 事件源（替代 vscode.EventEmitter，保持宿主无关） */
 class Emitter {
   constructor() {
@@ -456,7 +497,7 @@ export class WasmDebugAdapter {
     const host = this.hostVersion ? `｜WebC++ ${this.hostVersion}` : "";
     this._term(
       `\x1b[1mwdb ${WDB_VERSION}\x1b[0m —— WebAssembly 源码级调试器（gdb 的 w 版）${host}\r\n` +
-      `\x1b[90mCopyright (C) 2026 hcz1017 及贡献者\r\n` +
+      `Copyright (C) 2026 hcz1017 及贡献者\r\n` +
       `License ${WDB_LICENSE}：GNU Affero 通用公共许可证第 3 版或更新 <https://www.gnu.org/licenses/agpl-3.0.html>\r\n` +
       `桩文件（wdb-stub.c / LICENSE.exception）另有链接例外，随作品分发不受 AGPL 传染。\r\n` +
       `这是自由软件：你可以自由修改与再分发；不提供任何担保。\r\n` +
@@ -558,9 +599,7 @@ export class WasmDebugAdapter {
     //    （a/main.cpp 与 b/main.cpp）会被误判成同一个 → 断点串到别的文件上。
     const srcKey = normalizeSourceUrl((args.source && (args.source.path || args.source.name)) || "");
     const tgtKey = normalizeSourceUrl(this.target.sourceUri || this.target.fileName);
-    const sameFile = (!!srcKey && srcKey === tgtKey) ||
-      // 兜底：宿主可能只给裸文件名（没有目录信息），此时才允许按文件名比较
-      (!!srcKey && !srcKey.includes("/") && sourceBaseName(srcKey) === sourceBaseName(tgtKey));
+    const sameFile = sameSourceFile(srcKey, tgtKey);
     if (!srcKey || !sameFile) {
       for (const b of args.breakpoints || []) {
         bps.push({ verified: false, line: b.line | 0, message: "不属于当前调试目标（只调试打开的那个文件）" });
@@ -571,7 +610,7 @@ export class WasmDebugAdapter {
       for (const set of this._bpsByFile.values()) for (const id of set) u0.add(id);
       this.enabledSites = u0;
       this._syncBreakpointsToWorker();
-      this.log(`断点 ${fileKey0}: 忽略（不是当前调试目标 ${this.target.fileName}）`);
+      this.log(`断点 ${fileKey0}: 忽略（不是当前调试目标 ${tgtKey}）`);
       this._respond(req, { breakpoints: bps });
       return;
     }
