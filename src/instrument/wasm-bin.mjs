@@ -248,6 +248,7 @@ function computeEmptyStackOffsets(bytes, body, sigCtx) {
   const blockStack = [];          // 每层块进入时的栈深
   let depth = 0;                  // 当前操作数栈深
   let poisoned = false;           // return/br 之后线性不可达：不再记 empty，只推进位置
+  let unknown = false;            // 遇到未知指令/无法解码：本层块内深度不可信，end 时重新对齐
   let p = body.localsEnd;
   // call 的栈效应：funcIdx → {pop, push}。函数索引空间 = import 函数在前。
   const callSignature = (fidx) => {
@@ -260,7 +261,7 @@ function computeEmptyStackOffsets(bytes, body, sigCtx) {
   };
   let stopped = false;            // 遇到无法线性解码的指令：保留已扫出的点，不再往后扫
   while (p < body.end && !stopped) {
-    if (!poisoned && depth === 0) empty.add(p);   // 只记录"可达且栈空"的指令边界
+    if (!poisoned && !unknown && depth === 0) empty.add(p);   // 只记录"可达且可信且栈空"的指令边界
     const op = bytes[p++];
     const pop = (n) => { depth = Math.max(0, depth - n); };
     const push = (n) => { depth += n; };
@@ -296,12 +297,20 @@ function computeEmptyStackOffsets(bytes, body, sigCtx) {
         else { stopped = true; break; }
         break;
       }
-      case 0x02: case 0x03: case 0x04:                                // block / loop / if
-        blockStack.push(depth); p++; break;                           // blocktype 立即数
+      case 0x02: case 0x03: case 0x04: {                              // block / loop / if
+        // ⚠️ if 会把条件值弹掉，进入块内的深度是 depth-1；以前一律 push(depth)，
+        //    导致每个 if 之后深度永久 +1，`depth === 0` 再也不成立 → 后面再也找不到空点。
+        const inner = op === 0x04 ? Math.max(0, depth - 1) : depth;
+        blockStack.push(inner);
+        p++;                                                          // blocktype 立即数（单字节）
+        break;
+      }
       case 0x05:                                                      // else
-        depth = blockStack[blockStack.length - 1] ?? depth; poisoned = false; break;
+        depth = blockStack[blockStack.length - 1] ?? depth; poisoned = false; unknown = false; break;
       case 0x0b:                                                      // end
-        depth = blockStack.pop() ?? 0; poisoned = false; break;
+        depth = blockStack.pop() ?? 0; poisoned = false; unknown = false;
+        if (!blockStack.length && stopped) stopped = false;           // 回到函数最外层：重新开始信任
+        break;
       case 0x0c: case 0x0d: {                                         // br / br_if
         let label = 0, sh = 0;
         for (;;) { const b = bytes[p++]; label |= (b & 0x7f) << sh; sh += 7; if (!(b & 0x80)) break; }
@@ -365,42 +374,67 @@ function computeEmptyStackOffsets(bytes, body, sigCtx) {
         depth += 1; p += 8; break;
       default: {
         const io = OP_STACK_EFFECT[op];
-        if (io == null) { stopped = true; break; }        // 未知指令：保留已扫出的点，停止后续扫描
+        if (io == null) {
+          // 未知指令：**不要永久放弃**（那会让后面所有语句塌陷到最后一个空点，见文件头注释）。
+          // 策略：本层块内深度不可信（unknown=true，期间不记录空点），
+          // 等遇到 end/else 用块入口深度重新对齐，之后继续正常扫描。
+          // 只有在函数最外层（blockStack 为空）都拿不到对齐时才算彻底放弃。
+          if (globalThis.__WDB_STACK_DBG) {
+            console.error(`[stack-sim] unknown op 0x${op.toString(16)} at ${p - 1} (body ${body.index}, depth ${depth}, blocks ${blockStack.length})`);
+          }
+          unknown = true;
+          break;
+        }
         depth = Math.max(0, depth - io[0]) + io[1];
         break;
       }
     }
   }
+  if (globalThis.__WDB_STACK_DBG) {
+    const arr = [...empty].sort((a, b) => a - b);
+    console.error(`[stack-sim] body ${body.index} range ${body.localsEnd}..${body.end} empty=${arr.length}` +
+      ` stopped=${stopped} visitedEnd=${p >= body.end}` +
+      ` first=[${arr.slice(0, 4).join(",")}] last=[${arr.slice(-4).join(",")}]`);
+  }
   return empty;
 }
-// 栈效应表：op -> [pop, push]；只建 -O0 clang 常见的子集，遇到未知的放弃该函数
-const OP_STACK_EFFECT = {
-  0x41: [0, 1], 0x42: [0, 1], 0x43: [0, 1], 0x44: [0, 1],           // *.const
-  0x20: [0, 1], 0x21: [1, 0], 0x22: [1, 1], 0x23: [0, 1], 0x24: [1, 0], // local/global
-  0x6a: [2, 1], 0x6b: [2, 1], 0x6c: [2, 1], 0x6d: [2, 1], 0x6e: [2, 1], 0x6f: [2, 1],
-  0x70: [2, 1], 0x71: [2, 1], 0x72: [2, 1], 0x73: [2, 1], 0x74: [2, 1], 0x75: [2, 1],
-  0x76: [2, 1], 0x77: [2, 1], 0x78: [2, 1], 0x79: [2, 1], 0x7a: [2, 1],
-  0x45: [1, 1], 0x46: [2, 1], 0x47: [2, 1], 0x48: [2, 1], 0x49: [2, 1], 0x4a: [2, 1],
-  0x4b: [2, 1], 0x4c: [2, 1], 0x4d: [2, 1], 0x4e: [2, 1], 0x4f: [2, 1], 0x50: [2, 1],
-  0x51: [2, 1], 0x52: [2, 1], 0x53: [2, 1], 0x54: [2, 1], 0x55: [2, 1], 0x56: [2, 1],
-  0x57: [2, 1], 0x58: [2, 1], 0x59: [2, 1], 0x5a: [2, 1], 0x5b: [2, 1], 0x5c: [2, 1],
-  0x5d: [2, 1], 0x5e: [2, 1], 0x5f: [2, 1], 0x60: [2, 1], 0x61: [2, 1], 0x62: [2, 1],
-  0x63: [2, 1], 0x64: [2, 1], 0x65: [2, 1], 0x66: [2, 1], 0x67: [2, 1], 0x68: [2, 1],
-  0x69: [2, 1],
-  0x28: [1, 1], 0x29: [1, 1], 0x2a: [1, 1], 0x2b: [1, 1], 0x2c: [1, 1], 0x2d: [1, 1],
-  0x2e: [1, 1], 0x2f: [1, 1], 0x30: [1, 1], 0x31: [1, 1], 0x32: [1, 1], 0x33: [1, 1],
-  0x34: [1, 1], 0x35: [1, 1],
-  0x36: [2, 0], 0x37: [2, 0], 0x38: [2, 0], 0x39: [2, 0], 0x3a: [2, 0], 0x3b: [2, 0],
-  0x3c: [2, 0], 0x3d: [2, 0], 0x3e: [2, 0], 0x3f: [2, 0], 0x40: [2, 0],
-  0x1a: [1, 0],                                                       // drop
-  0x7c: [2, 1], 0x7d: [2, 1], 0x7e: [2, 1], 0x7f: [2, 1], 0x80: [2, 1], 0x81: [2, 1],
-  0x82: [2, 1], 0x83: [2, 1], 0x84: [2, 1], 0x85: [2, 1], 0x86: [2, 1], 0x87: [2, 1],
-  0x88: [2, 1], 0x89: [2, 1], 0x8a: [2, 1], 0x8b: [2, 1], 0x8c: [2, 1], 0x8d: [2, 1],
-  0x8e: [2, 1], 0x8f: [2, 1], 0x90: [2, 1], 0x91: [2, 1],
-  0xa7: [1, 1], 0xa8: [1, 1], 0xa9: [1, 1], 0xaa: [1, 1], 0xab: [1, 1], 0xac: [1, 1],
-  0xad: [1, 1], 0xae: [1, 1], 0xaf: [1, 1], 0xb0: [1, 1], 0xb1: [1, 1], 0xb2: [1, 1],
-  0xb3: [1, 1], 0xb4: [1, 1], 0xb5: [1, 1], 0xb6: [1, 1],
-};
+// 栈效应表：op -> [pop, push]。
+//
+// ⚠️ 这张表**漏一条指令的代价是灾难性的**：`computeEmptyStackOffsets` 以前遇到未知指令会
+//    `stopped = true` 永久放弃该函数后续扫描，于是"最后一个已知空点"成了后面所有语句的
+//    唯一落点 —— 十几条语句挤在同一个探针上，断点看着"已验证"却永不触发、单步直接跑完。
+//    真实事故：`ceil(log2(n))` 产生的 `f64.ceil`(0x9b) 不在表里，main 后半段全部塌陷。
+//    所以这里按 wasm 规范**按区间**把 0x45..0xbf 的数值指令全部补全，不再靠"常见子集"。
+const OP_STACK_EFFECT = (() => {
+  const t = {};
+  const range = (from, to, pop, push) => { for (let op = from; op <= to; op++) t[op] = [pop, push]; };
+  range(0x45, 0x45, 1, 1);   // i32.eqz
+  range(0x46, 0x4f, 2, 1);   // i32 比较
+  range(0x50, 0x50, 1, 1);   // i64.eqz
+  range(0x51, 0x5a, 2, 1);   // i64 比较
+  range(0x5b, 0x60, 2, 1);   // f32 比较
+  range(0x61, 0x66, 2, 1);   // f64 比较
+  range(0x67, 0x69, 1, 1);   // i32.clz/ctz/popcnt
+  range(0x6a, 0x78, 2, 1);   // i32 算术/位
+  range(0x79, 0x7b, 1, 1);   // i64.clz/ctz/popcnt
+  range(0x7c, 0x8a, 2, 1);   // i64 算术/位
+  range(0x8b, 0x91, 1, 1);   // f32 一元（abs..sqrt）
+  range(0x92, 0x98, 2, 1);   // f32 二元
+  range(0x99, 0x9f, 1, 1);   // f64 一元（abs..sqrt）—— 0x9b=f64.ceil 就是漏掉的那条
+  range(0xa0, 0xa6, 2, 1);   // f64 二元
+  range(0xa7, 0xbf, 1, 1);   // 类型转换 / reinterpret（全部一元）
+  t[0x1a] = [1, 0];          // drop
+  t[0x1b] = [3, 1];          // select
+  // 带立即数的（load/store/call/local 等在 switch 里单独处理，这里只提供栈效应）
+  range(0x28, 0x35, 1, 1);   // *.load
+  range(0x36, 0x3e, 2, 0);   // *.store
+  t[0x3f] = [0, 1];          // memory.size
+  t[0x40] = [1, 1];          // memory.grow
+  t[0x20] = [0, 1]; t[0x21] = [1, 0]; t[0x22] = [1, 1];
+  t[0x23] = [0, 1]; t[0x24] = [1, 0]; t[0x25] = [0, 0]; t[0x26] = [0, 0];
+  t[0x41] = [0, 1]; t[0x42] = [0, 1]; t[0x43] = [0, 1]; t[0x44] = [0, 1];
+  return t;
+})();
 
 
 /**

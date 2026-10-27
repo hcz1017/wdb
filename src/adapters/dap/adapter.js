@@ -953,6 +953,24 @@ export class WasmDebugAdapter {
 
     const instr = instrumentWasm(orig, sites.map((s) => ({ id: s.id, offset: s.origOffset })));
     if (instr.dropped && instr.dropped.length) this.log(`插桩丢弃 ${instr.dropped.length} 个点`);
+    // ⚠️ 多个站点落到同一个插桩位置时，插桩器只发一次探针，其余记为 alias（instr.sites[].aliasOf）。
+    //    这些 alias 必须写回 sites —— worker 的 probe() 靠 site.aliases 才能把
+    //    "探针报的是 A 行" 匹配到 "用户其实在 B 行下了断点"。以前没回写 → 断点"已验证"却永不触发。
+    {
+      const aliasOf = new Map();      // 主站点 id -> [别名站点 id]
+      for (const it of instr.sites || []) {
+        if (it && it.aliasOf != null) {
+          if (!aliasOf.has(it.aliasOf)) aliasOf.set(it.aliasOf, []);
+          aliasOf.get(it.aliasOf).push(it.id);
+        }
+      }
+      let merged = 0;
+      for (const st of sites) {
+        const a = aliasOf.get(st.id);
+        if (a && a.length) { st.aliases = a; merged += a.length; }
+      }
+      if (merged) this.log(`插桩合并：${merged} 个站点与他人共用探针（已记录 alias，断点仍生效）`);
+    }
     this.session = {
       engine, orig, instr, sites, siteByLine, codeBase, importCount,
       bodies: info.code.bodies,

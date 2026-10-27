@@ -169,7 +169,15 @@ function probe(siteId) {
       scratchBase = 0;
     }
   }
-  pending = site;
+  // 命中的可能是"别名站点"（多个语句共用同一探针）：此时上报用户下断点的那一行，
+  // 但函数体沿用真正执行的位置（locals 快照区/栈帧统计都按它算）。
+  let report = site;
+  if (isBreakpoint) {
+    const markId = ids.find((id) => (Atomics.load(bp, id >>> 5) & (1 << (id & 31))) !== 0);
+    const rep = markId != null ? siteById.get(markId) : null;
+    if (rep && rep.id !== site.id) report = { ...rep, body: site.body };
+  }
+  pending = report;
   return scratchBase;
 }
 
